@@ -165,3 +165,32 @@ def fmp_ratios(symbols: List[str]) -> pd.DataFrame:
 
 @st.cache_data(ttl=12*60*60, show_spinner=False)
 def price_history(symbol: str, period="3y") -> pd.DataFrame:
+    """
+    Download daily price history via yfinance and compute indicators:
+    200-SMA, RSI(14), MACD(12,26,9), ADX(14), ROC(252).
+    """
+    df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False)
+    if df.empty:
+        return df
+
+    # Indicators
+    df["SMA200"] = ta.sma(df["Close"], length=SMA_LEN)
+    df["RSI"]    = ta.rsi(df["Close"], length=RSI_LEN)
+
+    macd = ta.macd(df["Close"], fast=12, slow=26, signal=9)
+    if macd is not None and not macd.empty:
+        df["MACD"]        = macd["MACD_12_26_9"]
+        df["MACD_SIGNAL"] = macd["MACDs_12_26_9"]
+
+    adx = ta.adx(high=df["High"], low=df["Low"], close=df["Close"], length=ADX_LEN)
+    if adx is not None and not adx.empty:
+        df["ADX"] = adx["ADX_14"]
+
+    df["ROC"] = ta.roc(df["Close"], length=ROC_LEN)
+
+    return df.dropna().copy()
+
+# ------------------------
+# Scoring helpers
+# ------------------------
+def percentile_value(series: pd.Series, x: float) -> float:
