@@ -6,7 +6,7 @@ import numpy as np
 import streamlit as st
 import yfinance as yf
 import pandas_ta as ta
-from typing import List
+from typing import List, Optional, Dict
 
 # ------------------------
 # Page config
@@ -34,34 +34,90 @@ UA_HEADERS = {
 }
 
 # ------------------------
-# Data loaders
+# Utilities
+# ------------------------
+def normalize_constituents(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize any constituents table into columns: ticker, company, sector.
+    Tries multiple common header variants and cleans tickers for Yahoo ('.' -> '-').
+    Returns an empty DataFrame with correct columns if normalization fails.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ticker", "company", "sector"])
+
+    # map lowercase column names -> original names
+    cols_map: Dict[str, str] = {str(c).strip().lower(): c for c in df.columns}
+
+    # candidate names for each required field
+    ticker_keys  = ["ticker", "symbol", "ticker symbol"]
+    company_keys = ["company", "security", "name", "company name"]
+    sector_keys  = ["sector", "gics sector", "industry"]
+
+    def pick(keys: List[str]) -> Optional[str]:
+        for k in keys:
+            if k in cols_map:
+                return cols_map[k]
+        return None
+
+    tcol = pick(ticker_keys)
+    ccol = pick(company_keys)
+    scol = pick(sector_keys)
+
+    # If we don't at least have ticker and company, fail early
+    if tcol is None or ccol is None:
+        return pd.DataFrame(columns=["ticker", "company", "sector"])
+
+    out = pd.DataFrame({
+        "ticker":  df[tcol].astype(str).str.strip(),
+        "company": df[ccol].astype(str).str.strip()
+    })
+
+    if scol is not None:
+        out["sector"] = df[scol].astype(str).str.strip()
+    else:
+        out["sector"] = "Unknown"
+
+    # Clean tickers: Yahoo uses '-' not '.' (e.g. BRK.B -> BRK-B)
+    out["ticker"] = (
+        out["ticker"]
+        .str.upper()
+        .str.replace(".", "-", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+
+    # Drop blatantly bad rows
+    out = out.replace({"ticker": {"": np.nan}}).dropna(subset=["ticker"]).drop_duplicates("ticker")
+
+    # Keep only required columns (correct order)
+    return out[["ticker", "company", "sector"]]
+
+
+# ------------------------
+# Data loaders (raw)
 # ------------------------
 @st.cache_data(ttl=6*60*60)
-def load_sp500_tickers() -> pd.DataFrame:
+def load_sp500_tickers_raw() -> pd.DataFrame:
     """
-    Primary source: Wikipedia constituents table (live).
+    Primary source: Wikipedia constituents table (raw).
     Fetch with a browser-like User-Agent to reduce 403s, then parse HTML using lxml.
+    We return the raw table; normalization happens later.
     """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
         resp = SESSION.get(url, headers=UA_HEADERS, timeout=20)
-        resp.raise_for_status()  # bubble up 403/404/etc
-        tables = pd.read_html(resp.text, flavor="lxml")  # requires lxml installed
-        df = tables[0]
-        df = df.rename(columns={"Symbol": "ticker", "Security": "company", "GICS Sector": "sector"})
-        # Yahoo tickers use '-' instead of '.' (e.g., BRK.B -> BRK-B)
-        df["ticker"] = df["ticker"].astype(str).str.replace(".", "-", regex=False)
-        return df[["ticker", "company", "sector"]]
-    except Exception as e:
-        # Return empty so the caller can switch to the fallback
-        st.warning(f"Wikipedia source unavailable ({type(e).__name__}): falling back.")
-        return pd.DataFrame(columns=["ticker", "company", "sector"])
+        resp.raise_for_status()
+        tables = pd.read_html(resp.text, flavor="lxml")
+        if not tables:
+            return pd.DataFrame()
+        return tables[0]
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=6*60*60)
-def load_sp500_fallback() -> pd.DataFrame:
+def load_sp500_fallback_raw() -> pd.DataFrame:
     """
-    Fallback sources if Wikipedia blocks or times out:
+    Fallback sources if Wikipedia blocks or times out (raw tables):
       - TradingView components page
       - TopForeignStocks S&P 500 components list
     """
@@ -71,24 +127,10 @@ def load_sp500_fallback() -> pd.DataFrame:
         resp = SESSION.get(url_tv, headers=UA_HEADERS, timeout=20)
         resp.raise_for_status()
         tables = pd.read_html(resp.text, flavor="lxml")
-        if len(tables) > 0:
-            df = tables[0]
-            # Normalize common column names across variants
-            if "Symbol" in df.columns:
-                df = df.rename(columns={"Symbol": "ticker"})
-            elif "Ticker" in df.columns:
-                df = df.rename(columns={"Ticker": "ticker"})
-            if "Company" in df.columns:
-                df = df.rename(columns={"Company": "company"})
-            elif "Name" in df.columns:
-                df = df.rename(columns={"Name": "company"})
-            # Sector if present; otherwise "Unknown"
-            df["sector"] = df["Sector"] if "Sector" in df.columns else "Unknown"
-            df["ticker"] = df["ticker"].astype(str).str.replace(".", "-", regex=False)
-            if set(["ticker", "company", "sector"]).issubset(df.columns):
-                return df[["ticker", "company", "sector"]].dropna()
+        if tables:
+            return tables[0]
     except Exception:
-        pass  # fall through to secondary source
+        pass
 
     # Option B: TopForeignStocks
     try:
@@ -96,28 +138,20 @@ def load_sp500_fallback() -> pd.DataFrame:
         resp = SESSION.get(url_tfs, headers=UA_HEADERS, timeout=20)
         resp.raise_for_status()
         tables = pd.read_html(resp.text, flavor="lxml")
-        # Look for a table with Ticker + Company/Name + Sector/Industry
-        for t in tables:
-            cols_lower = {str(c).lower(): c for c in t.columns}
-            has_ticker = "ticker" in cols_lower
-            has_company = ("company" in cols_lower) or ("name" in cols_lower) or ("company name" in cols_lower)
-            if has_ticker and has_company:
-                company_col = cols_lower.get("company") or cols_lower.get("name") or cols_lower.get("company name")
-                df = t.rename(columns={cols_lower["ticker"]: "ticker", company_col: "company"})
-                sector_col = cols_lower.get("sector") or cols_lower.get("industry")
-                if sector_col:
-                    df = df.rename(columns={sector_col: "sector"})
-                else:
-                    df["sector"] = "Unknown"
-                df["ticker"] = df["ticker"].astype(str).str.replace(".", "-", regex=False)
-                if set(["ticker", "company", "sector"]).issubset(df.columns):
-                    return df[["ticker", "company", "sector"]].dropna()
+        # Return the first reasonable-looking table; normalization will decide columns
+        if tables:
+            # Pick the widest table as most likely candidates
+            tables_sorted = sorted(tables, key=lambda t: t.shape[1], reverse=True)
+            return tables_sorted[0]
     except Exception:
         pass
 
-    return pd.DataFrame(columns=["ticker", "company", "sector"])
+    return pd.DataFrame()
 
 
+# ------------------------
+# Fundamentals (FMP)
+# ------------------------
 @st.cache_data(ttl=24*60*60, show_spinner=False)
 def fmp_ratios(symbols: List[str]) -> pd.DataFrame:
     """
@@ -159,7 +193,6 @@ def fmp_ratios(symbols: List[str]) -> pd.DataFrame:
                 "revenue_growth": r.get("revenueGrowth", np.nan) or r.get("revenueGrowthTTM", np.nan),
             })
         except Exception:
-            # Keep going even if one symbol fails
             rows.append({"ticker": sym})
         time.sleep(0.2)  # polite pacing for free tier
 
@@ -177,40 +210,33 @@ def price_history(symbol: str, period="3y") -> pd.DataFrame:
     Retries on rate-limit with exponential backoff.
     """
     max_tries = 3
-    delay = 1.0  # seconds (initial)
+    delay = 1.0
     df = pd.DataFrame()
 
-    for attempt in range(1, max_tries + 1):
+    for _ in range(max_tries):
         try:
-            # small global throttle to reduce "Too Many Requests"
-            time.sleep(0.3)
-
+            time.sleep(0.3)  # global throttle
             df = yf.download(
                 symbol,
                 period=period,
                 interval="1d",
                 auto_adjust=True,
                 progress=False,
-                threads=False  # single-threaded: kinder to Yahoo
+                threads=False
             )
             if not df.empty:
                 break
-
         except Exception as e:
             msg = str(e).lower()
+            time.sleep(delay)
+            delay *= 2
             if "rate limit" in msg or "too many requests" in msg:
-                # exponential backoff
-                time.sleep(delay)
-                delay *= 2
                 continue
             else:
-                # other transient network errors: do one more gentle retry
-                time.sleep(delay)
-                delay *= 2
                 continue
 
     if df.empty:
-        return df  # let caller skip the symbol
+        return df
 
     # Indicators
     df["SMA200"] = ta.sma(df["Close"], length=SMA_LEN)
@@ -222,10 +248,7 @@ def price_history(symbol: str, period="3y") -> pd.DataFrame:
         df["MACD_SIGNAL"] = macd["MACDs_12_26_9"]
 
     adx = ta.adx(high=df["High"], low=df["Low"], close=df["Close"], length=ADX_LEN)
-    if adx is not None and not adx.empty and "ADX_14" in adx.columns:
-        df["ADX"] = adx["ADX_14"]
-    else:
-        df["ADX"] = np.nan
+    df["ADX"] = adx["ADX_14"] if adx is not None and not adx.empty and "ADX_14" in adx.columns else np.nan
 
     df["ROC"] = ta.roc(df["Close"], length=ROC_LEN)
 
@@ -306,28 +329,32 @@ def score_roc(roc, peer):
 src_banner = st.empty()
 left, right = st.columns([1, 3])
 with left:
-    # Placeholder; real sector list appears after loading
-    pick_sector = st.selectbox("Filter sector (optional)", ["All"])
+    pick_sector = st.selectbox("Filter sector (optional)", ["All"])  # placeholder
     top_n       = st.slider("Show Top N", 10, 200, 50, step=10)
     run_btn     = st.button("Run Screening", type="primary")
 with right:
     st.info("Full 100‑point scoring requires an **FMP API key** in Secrets. "
             "Without it, the app still computes **Technicals & Trend** (45 pts).")
 
+
 # ------------------------
 # Run workflow
 # ------------------------
 if run_btn:
-    # Load constituents with graceful fallback
+    # Load raw constituents
     with st.spinner("Loading S&P 500 constituents…"):
-        meta = load_sp500_tickers()
+        meta_raw = load_sp500_tickers_raw()
         source_used = "Wikipedia"
-        if meta.empty:
-            meta = load_sp500_fallback()
+        if meta_raw is None or meta_raw.empty:
+            st.warning("Wikipedia source unavailable: falling back.")
+            meta_raw = load_sp500_fallback_raw()
             source_used = "Fallback source"
 
-    if meta.empty:
-        st.error("Could not load S&P 500 constituents from any source right now. Please retry.")
+    # Normalize columns robustly
+    meta = normalize_constituents(meta_raw)
+
+    if meta.empty or not set(["ticker", "company", "sector"]).issubset(meta.columns):
+        st.error("Could not normalize S&P 500 constituents from any source right now. Please retry.")
         st.stop()
 
     src_banner.info(f"Universe size: **{len(meta)}** • Source: **{source_used}**")
@@ -340,6 +367,10 @@ if run_btn:
     universe = meta.copy()
     if pick_sector != "All":
         universe = universe[universe["sector"] == pick_sector]
+
+    if universe.empty:
+        st.error("No companies available for the selected filter.")
+        st.stop()
 
     symbols = universe["ticker"].tolist()
 
@@ -373,3 +404,96 @@ if run_btn:
             "roc": last.get("ROC"),
         })
 
+        # polite pacing between symbols
+        time.sleep(0.1)
+
+    if skipped:
+        sample = ", ".join(skipped[:10])
+        more = " ..." if len(skipped) > 10 else ""
+        st.warning(f"Skipped {len(skipped)} tickers due to rate limits or empty data: {sample}{more}")
+
+    tech = pd.DataFrame(tech_rows)
+
+    # Merge
+    df = universe.merge(tech, on="ticker", how="left")
+    if have_fund:
+        df = df.merge(fund, on="ticker", how="left")
+
+    # Peer vectors for percentile scoring
+    peers = {"roc": df["roc"]}
+    if have_fund:
+        peers.update({
+            "ps_ratio": df["ps_ratio"],
+            "peg_ratio": df["peg_ratio"],
+            "fcf_yield": df["fcf_yield"],
+            "de_ratio": df["de_ratio"],
+            "gross_margin": df["gross_margin"],
+            "revenue_growth": df["revenue_growth"],
+        })
+
+    # Scores
+    if have_fund:
+        df["score_ps"]   = df["ps_ratio"].apply(lambda x: score_low_good(x, peers["ps_ratio"]))
+        df["score_peg"]  = df["peg_ratio"].apply(lambda x: score_low_good(x, peers["peg_ratio"]))
+        df["score_fcfy"] = df["fcf_yield"].apply(lambda x: score_high_good(x, peers["fcf_yield"]))
+        df["score_de"]   = df["de_ratio"].apply(lambda x: score_low_good(x, peers["de_ratio"]))
+        df["score_gm"]   = df["gross_margin"].apply(lambda x: score_high_good(x, peers["gross_margin"]))
+        # Revenue Growth worth 5 points (half-weight):
+        df["score_rev"]  = df["revenue_growth"].apply(lambda x: 0.5 * score_high_good(x, peers["revenue_growth"]))
+    else:
+        for c in ["score_ps","score_peg","score_fcfy","score_de","score_gm","score_rev"]:
+            df[c] = np.nan
+
+    df["score_rsi"]   = df["rsi"].apply(score_rsi)
+    df["score_macd"]  = df.apply(lambda r: score_macd(r["macd"], r["macd_signal"]), axis=1)
+    df["score_pv200"] = df.apply(lambda r: score_price_vs_200(r["close"], r["sma200"]), axis=1)
+    df["score_adx"]   = df["adx"].apply(score_adx)
+    df["score_roc"]   = df["roc"].apply(lambda x: score_roc(x, peers["roc"]))
+
+    # Category totals
+    df["Valuation"] = df[["score_ps","score_peg","score_fcfy"]].sum(axis=1, min_count=1)
+    df["Quality"]   = df[["score_de","score_gm","score_rev"]].sum(axis=1, min_count=1)
+    df["Momentum"]  = df[["score_rsi","score_macd","score_pv200"]].sum(axis=1, min_count=1)
+    df["Trend"]     = df[["score_adx","score_roc"]].sum(axis=1, min_count=1)
+
+    # Total (works even if fundamentals are missing)
+    df["TotalScore"] = df[["Valuation","Quality","Momentum","Trend"]].sum(axis=1, min_count=1)
+
+    out_cols = [
+        "ticker","company","sector","TotalScore","Valuation","Quality","Momentum","Trend",
+        "ps_ratio","peg_ratio","fcf_yield","de_ratio","gross_margin","revenue_growth",
+        "rsi","macd","macd_signal","adx","roc","close"
+    ]
+    view = df[out_cols].sort_values("TotalScore", ascending=False).head(top_n).reset_index(drop=True)
+
+    st.subheader("Top Ranked")
+    st.dataframe(view, use_container_width=True)
+
+    # Download
+    st.download_button(
+        "Download CSV",
+        view.to_csv(index=False).encode(),
+        file_name="sp500_ratings.csv",
+        mime="text/csv"
+    )
+
+    # Drill‑down charts
+    sel = st.selectbox("Show charts for:", view["ticker"])
+    if sel:
+        hist = price_history(sel, period="3y")
+        if not hist.empty:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**{sel} – Price with 200‑SMA**")
+                st.line_chart(hist[["Close","SMA200"]])
+                st.caption("Prices via Yahoo Finance (`yfinance`). Indicators via `pandas_ta`.")
+            with c2:
+                st.markdown("**RSI & MACD**")
+                st.line_chart(hist["RSI"])
+                macd_plot = hist[["MACD","MACD_SIGNAL"]].dropna()
+                if not macd_plot.empty:
+                    st.line_chart(macd_plot)
+            c3, _ = st.columns([1,1])
+            with c3:
+                st.markdown("**ADX & ROC**")
+                st.line_chart(hist[["ADX","ROC"]])
