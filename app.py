@@ -57,6 +57,7 @@ def load_sp500_tickers() -> pd.DataFrame:
         st.warning(f"Wikipedia source unavailable ({type(e).__name__}): falling back.")
         return pd.DataFrame(columns=["ticker", "company", "sector"])
 
+
 @st.cache_data(ttl=6*60*60)
 def load_sp500_fallback() -> pd.DataFrame:
     """
@@ -116,6 +117,7 @@ def load_sp500_fallback() -> pd.DataFrame:
 
     return pd.DataFrame(columns=["ticker", "company", "sector"])
 
+
 @st.cache_data(ttl=24*60*60, show_spinner=False)
 def fmp_ratios(symbols: List[str]) -> pd.DataFrame:
     """
@@ -163,15 +165,52 @@ def fmp_ratios(symbols: List[str]) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
+
+# ------------------------
+# Prices + indicators (with Yahoo backoff)
+# ------------------------
 @st.cache_data(ttl=12*60*60, show_spinner=False)
 def price_history(symbol: str, period="3y") -> pd.DataFrame:
     """
     Download daily price history via yfinance and compute indicators:
     200-SMA, RSI(14), MACD(12,26,9), ADX(14), ROC(252).
+    Retries on rate-limit with exponential backoff.
     """
-    df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False)
+    max_tries = 3
+    delay = 1.0  # seconds (initial)
+    df = pd.DataFrame()
+
+    for attempt in range(1, max_tries + 1):
+        try:
+            # small global throttle to reduce "Too Many Requests"
+            time.sleep(0.3)
+
+            df = yf.download(
+                symbol,
+                period=period,
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False  # single-threaded: kinder to Yahoo
+            )
+            if not df.empty:
+                break
+
+        except Exception as e:
+            msg = str(e).lower()
+            if "rate limit" in msg or "too many requests" in msg:
+                # exponential backoff
+                time.sleep(delay)
+                delay *= 2
+                continue
+            else:
+                # other transient network errors: do one more gentle retry
+                time.sleep(delay)
+                delay *= 2
+                continue
+
     if df.empty:
-        return df
+        return df  # let caller skip the symbol
 
     # Indicators
     df["SMA200"] = ta.sma(df["Close"], length=SMA_LEN)
@@ -183,12 +222,15 @@ def price_history(symbol: str, period="3y") -> pd.DataFrame:
         df["MACD_SIGNAL"] = macd["MACDs_12_26_9"]
 
     adx = ta.adx(high=df["High"], low=df["Low"], close=df["Close"], length=ADX_LEN)
-    if adx is not None and not adx.empty:
+    if adx is not None and not adx.empty and "ADX_14" in adx.columns:
         df["ADX"] = adx["ADX_14"]
+    else:
+        df["ADX"] = np.nan
 
     df["ROC"] = ta.roc(df["Close"], length=ROC_LEN)
 
     return df.dropna().copy()
+
 
 # ------------------------
 # Scoring helpers
@@ -200,21 +242,25 @@ def percentile_value(series: pd.Series, x: float) -> float:
         return np.nan
     return float((s <= x).mean())
 
+
 def score_low_good(x, peer):
     """Lower is better → higher score (0..10)."""
     p = percentile_value(peer, x)
     return 10 * (1 - p) if pd.notna(p) else np.nan
+
 
 def score_high_good(x, peer):
     """Higher is better → higher score (0..10)."""
     p = percentile_value(peer, x)
     return 10 * p if pd.notna(p) else np.nan
 
+
 def score_rsi(rsi):
     """10 at RSI=50; 0 at <=30 or >=70 (linear)."""
     if pd.isna(rsi):
         return np.nan
     return max(0.0, 10.0 * (1 - abs(rsi - 50) / 20))
+
 
 def score_macd(macd, signal):
     """MACD positive & above signal → 10; above signal → 6; else 0."""
@@ -226,6 +272,7 @@ def score_macd(macd, signal):
         return 6.0
     return 0.0
 
+
 def score_price_vs_200(close, sma200):
     """Premium vs 200-SMA: full 5 pts at +10% or more (0..5)."""
     if pd.isna(close) or pd.isna(sma200) or sma200 == 0:
@@ -233,19 +280,25 @@ def score_price_vs_200(close, sma200):
     prem = (close / sma200) - 1
     return 5.0 * float(np.clip(prem / 0.10, 0, 1))
 
+
 def score_adx(adx):
     """Trend strength (ADX): >=25→10; 20–25→7; 15–20→3; else 0."""
     if pd.isna(adx):
         return np.nan
-    if adx >= 25: return 10.0
-    if adx >= 20: return 7.0
-    if adx >= 15: return 3.0
+    if adx >= 25:
+        return 10.0
+    if adx >= 20:
+        return 7.0
+    if adx >= 15:
+        return 3.0
     return 0.0
+
 
 def score_roc(roc, peer):
     """12‑month ROC percentile → 0..10."""
     p = percentile_value(peer, roc)
     return 10 * p if pd.notna(p) else np.nan
+
 
 # ------------------------
 # UI (render controls first)
@@ -300,10 +353,14 @@ if run_btn:
 
     # Technicals: compute latest snapshot for each symbol
     tech_rows = []
+    skipped = []  # track symbols skipped due to rate limits or empty data
+
     for sym in symbols:
         df = price_history(sym)
         if df.empty:
+            skipped.append(sym)
             continue
+
         last = df.iloc[-1]
         tech_rows.append({
             "ticker": sym,
@@ -315,88 +372,4 @@ if run_btn:
             "adx": last.get("ADX"),
             "roc": last.get("ROC"),
         })
-    tech = pd.DataFrame(tech_rows)
 
-    # Merge
-    df = universe.merge(tech, on="ticker", how="left")
-    if have_fund:
-        df = df.merge(fund, on="ticker", how="left")
-
-    # Peer vectors for percentile scoring
-    peers = {"roc": df["roc"]}
-    if have_fund:
-        peers.update({
-            "ps_ratio": df["ps_ratio"],
-            "peg_ratio": df["peg_ratio"],
-            "fcf_yield": df["fcf_yield"],
-            "de_ratio": df["de_ratio"],
-            "gross_margin": df["gross_margin"],
-            "revenue_growth": df["revenue_growth"],
-        })
-
-    # Scores
-    if have_fund:
-        df["score_ps"]   = df["ps_ratio"].apply(lambda x: score_low_good(x, peers["ps_ratio"]))
-        df["score_peg"]  = df["peg_ratio"].apply(lambda x: score_low_good(x, peers["peg_ratio"]))
-        df["score_fcfy"] = df["fcf_yield"].apply(lambda x: score_high_good(x, peers["fcf_yield"]))
-        df["score_de"]   = df["de_ratio"].apply(lambda x: score_low_good(x, peers["de_ratio"]))
-        df["score_gm"]   = df["gross_margin"].apply(lambda x: score_high_good(x, peers["gross_margin"]))
-        # Revenue Growth worth 5 points (half-weight):
-        df["score_rev"]  = df["revenue_growth"].apply(lambda x: 0.5 * score_high_good(x, peers["revenue_growth"]))
-    else:
-        for c in ["score_ps","score_peg","score_fcfy","score_de","score_gm","score_rev"]:
-            df[c] = np.nan
-
-    df["score_rsi"]   = df["rsi"].apply(score_rsi)
-    df["score_macd"]  = df.apply(lambda r: score_macd(r["macd"], r["macd_signal"]), axis=1)
-    df["score_pv200"] = df.apply(lambda r: score_price_vs_200(r["close"], r["sma200"]), axis=1)
-    df["score_adx"]   = df["adx"].apply(score_adx)
-    df["score_roc"]   = df["roc"].apply(lambda x: score_roc(x, peers["roc"]))
-
-    # Category totals
-    df["Valuation"] = df[["score_ps","score_peg","score_fcfy"]].sum(axis=1, min_count=1)
-    df["Quality"]   = df[["score_de","score_gm","score_rev"]].sum(axis=1, min_count=1)
-    df["Momentum"]  = df[["score_rsi","score_macd","score_pv200"]].sum(axis=1, min_count=1)
-    df["Trend"]     = df[["score_adx","score_roc"]].sum(axis=1, min_count=1)
-
-    # Total (works even if fundamentals are missing)
-    df["TotalScore"] = df[["Valuation","Quality","Momentum","Trend"]].sum(axis=1, min_count=1)
-
-    out_cols = [
-        "ticker","company","sector","TotalScore","Valuation","Quality","Momentum","Trend",
-        "ps_ratio","peg_ratio","fcf_yield","de_ratio","gross_margin","revenue_growth",
-        "rsi","macd","macd_signal","adx","roc","close"
-    ]
-    view = df[out_cols].sort_values("TotalScore", ascending=False).head(top_n).reset_index(drop=True)
-
-    st.subheader("Top Ranked")
-    st.dataframe(view, use_container_width=True)
-
-    # Download
-    st.download_button(
-        "Download CSV",
-        view.to_csv(index=False).encode(),
-        file_name="sp500_ratings.csv",
-        mime="text/csv"
-    )
-
-    # Drill‑down charts
-    sel = st.selectbox("Show charts for:", view["ticker"])
-    if sel:
-        hist = price_history(sel, period="3y")
-        if not hist.empty:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(f"**{sel} – Price with 200‑SMA**")
-                st.line_chart(hist[["Close","SMA200"]])
-                st.caption("Prices via Yahoo Finance (`yfinance`). Indicators via `pandas_ta`.")
-            with c2:
-                st.markdown("**RSI & MACD**")
-                st.line_chart(hist["RSI"])
-                macd_plot = hist[["MACD","MACD_SIGNAL"]].dropna()
-                if not macd_plot.empty:
-                    st.line_chart(macd_plot)
-            c3, _ = st.columns([1,1])
-            with c3:
-                st.markdown("**ADX & ROC**")
-                st.line_chart(hist[["ADX","ROC"]])
