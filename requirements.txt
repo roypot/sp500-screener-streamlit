@@ -4,3 +4,4 @@ pandas>=2.2
 numpy>=2.0
 pandas_ta>=0.3.14b
 requests>=2.32
+lxml>=5.3   # <-- add this line
