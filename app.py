@@ -40,7 +40,7 @@ UA_HEADERS = {
 def load_sp500_tickers() -> pd.DataFrame:
     """
     Primary source: Wikipedia constituents table.
-    Fetch with a browser-like User-Agent to reduce 403s, then parse the HTML string using lxml.
+    Fetch with a browser-like User-Agent to reduce 403s, then parse the HTML using lxml.
     """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
@@ -70,9 +70,9 @@ def load_sp500_fallback() -> pd.DataFrame:
         resp = SESSION.get(url_tv, headers=UA_HEADERS, timeout=20)
         resp.raise_for_status()
         tables = pd.read_html(resp.text, flavor="lxml")
-        if tables:
+        if len(tables) > 0:
             df = tables[0]
-            # Try to normalize common column names across variants
+            # Normalize common column names across variants
             if "Symbol" in df.columns:
                 df = df.rename(columns={"Symbol": "ticker"})
             elif "Ticker" in df.columns:
@@ -81,7 +81,8 @@ def load_sp500_fallback() -> pd.DataFrame:
                 df = df.rename(columns={"Company": "company"})
             elif "Name" in df.columns:
                 df = df.rename(columns={"Name": "company"})
-            df["sector"] = df.get("Sector", "Unknown")
+            # Sector if present; otherwise "Unknown"
+            df["sector"] = df["Sector"] if "Sector" in df.columns else "Unknown"
             df["ticker"] = df["ticker"].astype(str).str.replace(".", "-", regex=False)
             if set(["ticker", "company", "sector"]).issubset(df.columns):
                 return df[["ticker", "company", "sector"]].dropna()
@@ -96,8 +97,10 @@ def load_sp500_fallback() -> pd.DataFrame:
         tables = pd.read_html(resp.text, flavor="lxml")
         # Look for a table with Ticker + Company/Name + Sector/Industry
         for t in tables:
-            cols_lower = {c.lower(): c for c in t.columns}
-            if "ticker" in cols_lower and ("name" in cols_lower or "company name" in cols_lower or "company" in cols_lower):
+            cols_lower = {str(c).lower(): c for c in t.columns}
+            if "ticker" in cols_lower and (
+                "name" in cols_lower or "company name" in cols_lower or "company" in cols_lower
+            ):
                 company_col = cols_lower.get("company") or cols_lower.get("name") or cols_lower.get("company name")
                 df = t.rename(columns={cols_lower["ticker"]: "ticker", company_col: "company"})
                 sector_col = cols_lower.get("sector") or cols_lower.get("industry")
@@ -122,7 +125,7 @@ def fmp_ratios(symbols: List[str]) -> pd.DataFrame:
     if not FMP_KEY:
         return pd.DataFrame()
 
-    def fetch(endpoint: str, params: dict):
+    def fetch(endpoint: str, params: dict) -> list:
         url = f"https://financialmodelingprep.com/stable/{endpoint}"
         params = params | {"apikey": FMP_KEY}
         r = SESSION.get(url, params=params, timeout=30)
@@ -149,3 +152,16 @@ def fmp_ratios(symbols: List[str]) -> pd.DataFrame:
                 "peg_ratio":    r.get("pegRatio", np.nan) or r.get("pegRatioTTM", np.nan),
                 "fcf_yield":    k.get("freeCashFlowYield", np.nan) or k.get("freeCashFlowYieldTTM", np.nan),
                 # Financial Quality (25)
+                "de_ratio":     r.get("debtToEquity", np.nan) or r.get("debtToEquityTTM", np.nan),
+                "gross_margin": r.get("grossProfitMargin", np.nan) or r.get("grossProfitMarginTTM", np.nan),
+                "revenue_growth": r.get("revenueGrowth", np.nan) or r.get("revenueGrowthTTM", np.nan),
+            })
+        except Exception:
+            # Keep going even if one symbol fails
+            rows.append({"ticker": sym})
+        time.sleep(0.2)  # polite pacing for free tier
+
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=12*60*60, show_spinner=False)
+def price_history(symbol: str, period="3y") -> pd.DataFrame:
